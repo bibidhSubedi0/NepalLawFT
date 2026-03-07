@@ -1,0 +1,55 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+ftenv/
+env/
+.env
+*.env
+
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+data
+data/raw_samples/*
+data/processed/*
+data/splits/*
+!data/raw_samples/.gitkeep
+!data/processed/.gitkeep
+!data/splits/.gitkeep
+
+models/*
+!models/.gitkeep
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+wandb/
+runs/
+
+# Secrets
+.env
+*.env
+secrets.json
