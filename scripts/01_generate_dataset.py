@@ -184,6 +184,7 @@ def strip_markdown_fences(raw):
 
 
 def ask_groq(rotator, chunk, language):
+    """Call Groq with automatic key rotation on any error."""
     import re
     prompt = PROMPT_NP.format(chunk=chunk) if language == "np" else PROMPT_EN.format(chunk=chunk)
 
@@ -362,12 +363,17 @@ def run_generation(rotator, chunks, out_np, out_en, limit):
 # ---------------------------------------------------------------------------
 
 CHUNKS_DIR = Path("data/processed/chunks")
+TOTAL_CORPUS_CHUNKS = 67_000  # approximate total chunks across all files
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None, help="Max new Q&A pairs to generate this run")
-    parser.add_argument("--split", action="store_true", help="Build train/val split after generation")
+    parser.add_argument("--target", type=int, default=10_000,
+                        help="Target total Q&A pairs across all files (default: 10000)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for chunk sampling (default: 42)")
+    parser.add_argument("--split", action="store_true",
+                        help="Build train/val split after generation")
     args = parser.parse_args()
 
     keys    = load_keys()
@@ -381,28 +387,60 @@ def main():
     if not chunk_files:
         raise FileNotFoundError(f"No .jsonl files found in {CHUNKS_DIR}")
 
-    print(f"Found {len(chunk_files)} file(s) in {CHUNKS_DIR}")
-    if args.limit:
-        print(f"Will stop after {args.limit} total new pairs across all files")
+    # --- Count valid chunks per file ---
+    print(f"Scanning {len(chunk_files)} file(s) to count valid chunks...")
+    file_chunks = {}  # path -> list of valid chunks
+    for chunk_file in chunk_files:
+        chunks = [c for c in load_chunks(chunk_file) if is_valid_chunk(c)]
+        if chunks:
+            file_chunks[chunk_file] = chunks
 
+    total_valid = sum(len(c) for c in file_chunks.values())
+    print(f"Total valid chunks across all files: {total_valid}")
+    print(f"Target samples: {args.target}")
+    print(f"{'File':<60} {'Chunks':>8} {'Share':>7} {'Quota':>7}")
+    print("-" * 85)
+
+    # --- Calculate per-file quota proportionally ---
+    quotas = {}
+    for chunk_file, chunks in file_chunks.items():
+        share    = len(chunks) / total_valid
+        quota    = max(1, round(share * args.target))
+        quotas[chunk_file] = quota
+        print(f"{chunk_file.name:<60} {len(chunks):>8} {share*100:>6.2f}% {quota:>7}")
+
+    # Adjust rounding drift so sum == target exactly
+    total_quota = sum(quotas.values())
+    diff = args.target - total_quota
+    if diff != 0:
+        # Add/remove from the file with the largest quota
+        biggest = max(quotas, key=quotas.get)
+        quotas[biggest] += diff
+
+    print(f"\nTotal quota: {sum(quotas.values())} pairs")
+
+    # --- Process each file ---
+    rng       = random.Random(args.seed)
     total_new = 0
-    for i, chunk_file in enumerate(chunk_files, 1):
-        remaining = (args.limit - total_new) if args.limit else None
-        if args.limit and remaining <= 0:
-            break
 
-        print(f"\n[{i}/{len(chunk_files)}] {chunk_file.name}")
-        chunks = load_chunks(chunk_file)
-        print(f"  {len(chunks)} chunks")
+    for i, (chunk_file, chunks) in enumerate(file_chunks.items(), 1):
+        quota = quotas[chunk_file]
+        print(f"\n[{i}/{len(file_chunks)}] {chunk_file.name}")
+        print(f"  {len(chunks)} valid chunks → sampling {quota}")
+
+        # Random sample without replacement (or all if quota >= available)
+        sampled = rng.sample(chunks, min(quota, len(chunks)))
 
         before_np = sum(1 for _ in open(out_np, encoding="utf-8")) if out_np.exists() else 0
         before_en = sum(1 for _ in open(out_en, encoding="utf-8")) if out_en.exists() else 0
 
-        run_generation(rotator, chunks, out_np, out_en, remaining)
+        run_generation(rotator, sampled, out_np, out_en, limit=quota)
 
         after_np = sum(1 for _ in open(out_np, encoding="utf-8")) if out_np.exists() else 0
         after_en = sum(1 for _ in open(out_en, encoding="utf-8")) if out_en.exists() else 0
-        total_new += (after_np - before_np) + (after_en - before_en)
+        generated = (after_np - before_np) + (after_en - before_en)
+        total_new += generated
+        print(f"  Generated {generated} pairs (running total: {total_new})")
 
     print(f"\nAll files done. {total_new} new pairs generated total.")
     if args.split:
