@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Paths ---
-CHUNKS_DIR = Path("data/processed/chunks")
 OUTPUT_DIR = Path("data/processed")
 SPLITS_DIR = Path("data/splits")
 
@@ -20,16 +19,16 @@ SPLITS_DIR = Path("data/splits")
 GROQ_MODEL       = "llama-3.1-8b-instant"
 TEMPERATURE      = 0.7
 MAX_TOKENS       = 512
-REQUESTS_PER_MIN = 30
+REQUESTS_PER_MIN = 30  # per key
 
 # --- Chunk filtering ---
 MIN_CHUNK_LEN = 150
 MAX_CHUNK_LEN = 1500
 
 # --- Dataset settings ---
-QA_PER_CHUNK    = 2
+QA_PER_CHUNK    = 1
 SAVE_EVERY      = 100
-TRAIN_RATIO     = 0.9 # 90% train, 10% val
+TRAIN_RATIO     = 0.9
 TARGET_NP_RATIO = 0.80
 
 SYSTEM_PROMPT = (
@@ -56,6 +55,69 @@ PROMPT_EN = """You are given a passage from a Nepali legal or governance documen
 
             Return JSON only (no extra text):
             {{"question": "...", "answer": "..."}}"""
+
+
+# ---------------------------------------------------------------------------
+# Key rotation
+# ---------------------------------------------------------------------------
+
+def load_keys():
+    keys = []
+    i = 1
+    while True:
+        key = os.getenv(f"GROQ_API_KEY{i}")
+        if not key:
+            break
+        keys.append(key)
+        i += 1
+    if not keys:
+        raise ValueError("No GROQ_API_KEY1, GROQ_API_KEY2, ... found in .env")
+    print(f"Loaded {len(keys)} API key(s) — effective rate limit: {REQUESTS_PER_MIN * len(keys)} req/min")
+    return keys
+
+
+class KeyRotator:
+    """Cycles through N Groq API keys. Rate-limited or errored keys go into
+    cooldown; the next available key is used. If ALL keys are cooling down,
+    waits until the earliest one recovers, then continues."""
+
+    def __init__(self, keys):
+        self.keys     = keys
+        self.clients  = {k: Groq(api_key=k) for k in keys}
+        self.cooldown = {}   # key -> timestamp when usable again
+        self._idx     = 0    # round-robin pointer
+
+    def _available(self):
+        now = time.time()
+        return [k for k in self.keys if self.cooldown.get(k, 0) <= now]
+
+    def get(self):
+        """Return (key, client), blocking until a key is available."""
+        while True:
+            available = self._available()
+            if available:
+                self._idx = self._idx % len(available)
+                key = available[self._idx]
+                self._idx += 1
+                return key, self.clients[key]
+            wait = min(self.cooldown[k] for k in self.keys) - time.time()
+            print(f"\n  [WAIT] All {len(self.keys)} keys rate-limited. "
+                  f"Resuming in {wait:.1f}s...", flush=True)
+            time.sleep(max(wait, 1))
+
+    def mark_rate_limited(self, key, retry_after=60):
+        self.cooldown[key] = time.time() + retry_after
+        n_avail = len(self._available())
+        print(f"\n  [LIMIT] Key ...{key[-6:]} cooling down {retry_after}s. "
+              f"{n_avail}/{len(self.keys)} keys still available.", flush=True)
+
+    def mark_error(self, key, cooldown_secs=30):
+        self.cooldown[key] = time.time() + cooldown_secs
+        print(f"\n  [ERROR] Key ...{key[-6:]} cooling down {cooldown_secs}s.", flush=True)
+
+    def disable(self, key):
+        self.cooldown[key] = float("inf")
+        print(f"\n  [DISABLED] Key ...{key[-6:]} permanently disabled.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -115,36 +177,54 @@ def is_valid_chunk(chunk_data):
 # ---------------------------------------------------------------------------
 
 def strip_markdown_fences(raw):
-    """Remove ```json ... ``` wrappers that the model sometimes adds."""
     if raw.startswith("```"):
         parts = raw.split("```")
         return parts[1].lstrip("json").strip() if len(parts) > 1 else raw
     return raw
 
 
-def ask_groq(client, chunk, language):
+def ask_groq(rotator, chunk, language):
+    import re
     prompt = PROMPT_NP.format(chunk=chunk) if language == "np" else PROMPT_EN.format(chunk=chunk)
-    try:
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = strip_markdown_fences(raw)
 
-        result = json.loads(raw)
-        if result.get("question") and result.get("answer"):
-            return result
-        return None
+    while True:
+        key, client = rotator.get()
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = strip_markdown_fences(raw)
+            result = json.loads(raw)
+            if result.get("question") and result.get("answer"):
+                return result
+            return None  # bad JSON shape — skip this chunk
 
-    except json.JSONDecodeError:
-        return None
-    except Exception as e:
-        print(f"\n  [WARN] Groq error: {e}")
-        time.sleep(10)
-        return None
+        except json.JSONDecodeError:
+            return None  # model returned non-JSON — skip this chunk
+
+        except Exception as e:
+            err = str(e).lower()
+
+            if "rate limit" in err or "429" in err:
+                retry_after = 60
+                m = re.search(r"try again in ([\d.]+)s", err)
+                if m:
+                    retry_after = float(m.group(1)) + 2
+                rotator.mark_rate_limited(key, retry_after=retry_after)
+                # loop — next available key will be picked
+
+            elif "401" in err or "invalid api key" in err:
+                rotator.disable(key)
+                # loop — try next key
+
+            else:
+                print(f"\n  [WARN] Key ...{key[-6:]}: {e}")
+                rotator.mark_error(key, cooldown_secs=30)
+                # loop — try next key
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +232,6 @@ def ask_groq(client, chunk, language):
 # ---------------------------------------------------------------------------
 
 def format_for_finetuning(question, answer, source_file):
-    """Wrap a Q&A pair in LLaMA 3 chat tokens for fine-tuning."""
     text = (
         f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
         f"{SYSTEM_PROMPT}<|eot_id|>"
@@ -192,7 +271,14 @@ def split_train_val(data):
 def build_dataset(out_np, out_en):
     print("\nBuilding final dataset with 80% Nepali / 20% English...")
 
-    combined             = balance_by_language(load_jsonl(out_np), load_jsonl(out_en))
+    all_np = load_jsonl(out_np) if out_np.exists() else []
+    all_en = load_jsonl(out_en) if out_en.exists() else []
+
+    if not all_np and not all_en:
+        print("  No data to split yet.")
+        return
+
+    combined             = balance_by_language(all_np, all_en)
     train_data, val_data = split_train_val(combined)
 
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
@@ -207,113 +293,121 @@ def build_dataset(out_np, out_en):
 # Generation loop
 # ---------------------------------------------------------------------------
 
-def process_chunk(client, chunk_data, chunk_file, seen_np, seen_en, f_np, f_en, delay):
-    text     = chunk_data.get("text", "")
-    language = chunk_data.get("language", "np")
-    source   = chunk_data.get("source_file", chunk_file.name)
-
-    added_np = added_en = 0
-
-    for _ in range(QA_PER_CHUNK):
-        result = ask_groq(client, text, language)
-        if not result:
-            continue
-
-        key  = source + result["question"]
-        seen = seen_np if language == "np" else seen_en
-        if key in seen:
-            continue
-
-        row = format_for_finetuning(result["question"], result["answer"], source)
-
-        if language == "np":
-            write_jsonl_line(f_np, row)
-            seen_np.add(key)
-            added_np += 1
-        else:
-            write_jsonl_line(f_en, row)
-            seen_en.add(key)
-            added_en += 1
-
-        time.sleep(delay)
-
-    return added_np, added_en
-
-
-def run_generation(client, chunk_files, out_np, out_en):
+def run_generation(rotator, chunks, out_np, out_en, limit):
     seen_np = load_already_processed(out_np)
     seen_en = load_already_processed(out_en)
 
-    if seen_np or seen_en:
+    already_done = len(seen_np) + len(seen_en)
+    if already_done:
         print(f"Resuming — {len(seen_np)} Nepali + {len(seen_en)} English pairs already done")
 
-    delay    = 60.0 / REQUESTS_PER_MIN
-    total_np = len(seen_np)
-    total_en = len(seen_en)
+    delay     = 60.0 / REQUESTS_PER_MIN / len(rotator.keys)
+    total_np  = len(seen_np)
+    total_en  = len(seen_en)
+    new_total = 0
 
     f_np = open(out_np, "a", encoding="utf-8")
     f_en = open(out_en, "a", encoding="utf-8")
 
     try:
-        for chunk_file in tqdm(chunk_files, desc="Files"):
-            chunks = load_chunks(chunk_file)
+        for chunk_data in tqdm(chunks, desc="Chunks"):
+            if limit and new_total >= limit:
+                print(f"\nReached limit of {limit} new samples.")
+                break
 
-            for chunk_data in tqdm(chunks, desc=f"  {chunk_file.name[:40]}", leave=False):
-                if not is_valid_chunk(chunk_data):
-                    continue
+            if not is_valid_chunk(chunk_data):
+                continue
 
-                added_np, added_en = process_chunk(
-                    client, chunk_data, chunk_file,
-                    seen_np, seen_en, f_np, f_en, delay
-                )
-                total_np += added_np
-                total_en += added_en
+            text     = chunk_data.get("text", "")
+            language = chunk_data.get("language", "np")
+            source   = chunk_data.get("source_file", "unknown")
 
-                total = total_np + total_en
-                if total % SAVE_EVERY == 0 and total > 0:
-                    f_np.flush()
-                    f_en.flush()
-                    print(f"\n  {total_np} Nepali + {total_en} English pairs so far...")
+            result = ask_groq(rotator, text, language)
+            if not result:
+                continue
+
+            key  = source + result["question"]
+            seen = seen_np if language == "np" else seen_en
+            if key in seen:
+                continue
+
+            row = format_for_finetuning(result["question"], result["answer"], source)
+
+            if language == "np":
+                write_jsonl_line(f_np, row)
+                seen_np.add(key)
+                total_np += 1
+            else:
+                write_jsonl_line(f_en, row)
+                seen_en.add(key)
+                total_en += 1
+
+            new_total += 1
+            time.sleep(delay)
+
+            if new_total % SAVE_EVERY == 0:
+                f_np.flush()
+                f_en.flush()
+                print(f"\n  {total_np} Nepali + {total_en} English pairs so far...")
+
     finally:
         f_np.close()
         f_en.close()
 
-    print(f"\nDone generating — {total_np} Nepali, {total_en} English pairs")
+    print(f"\nDone — {total_np} Nepali, {total_en} English pairs")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main(limit=None):
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not found in .env")
+CHUNKS_DIR = Path("data/processed/chunks")
 
-    client = Groq(api_key=api_key)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None, help="Max new Q&A pairs to generate this run")
+    parser.add_argument("--split", action="store_true", help="Build train/val split after generation")
+    args = parser.parse_args()
+
+    keys    = load_keys()
+    rotator = KeyRotator(keys)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    chunk_files = sorted(CHUNKS_DIR.glob("*.jsonl"))
-    if not chunk_files:
-        print(f"No JSONL files found in {CHUNKS_DIR}")
-        return
-
-    if limit:
-        chunk_files = chunk_files[:limit]
-        print(f"Test mode — processing {limit} file(s)")
-
-    print(f"Found {len(chunk_files)} file(s) in {CHUNKS_DIR}")
-
     out_np = OUTPUT_DIR / "qa_raw_np.jsonl"
     out_en = OUTPUT_DIR / "qa_raw_en.jsonl"
 
-    run_generation(client, chunk_files, out_np, out_en)
-    build_dataset(out_np, out_en)
+    chunk_files = sorted(CHUNKS_DIR.glob("*.jsonl"))
+    if not chunk_files:
+        raise FileNotFoundError(f"No .jsonl files found in {CHUNKS_DIR}")
+
+    print(f"Found {len(chunk_files)} file(s) in {CHUNKS_DIR}")
+    if args.limit:
+        print(f"Will stop after {args.limit} total new pairs across all files")
+
+    total_new = 0
+    for i, chunk_file in enumerate(chunk_files, 1):
+        remaining = (args.limit - total_new) if args.limit else None
+        if args.limit and remaining <= 0:
+            break
+
+        print(f"\n[{i}/{len(chunk_files)}] {chunk_file.name}")
+        chunks = load_chunks(chunk_file)
+        print(f"  {len(chunks)} chunks")
+
+        before_np = sum(1 for _ in open(out_np, encoding="utf-8")) if out_np.exists() else 0
+        before_en = sum(1 for _ in open(out_en, encoding="utf-8")) if out_en.exists() else 0
+
+        run_generation(rotator, chunks, out_np, out_en, remaining)
+
+        after_np = sum(1 for _ in open(out_np, encoding="utf-8")) if out_np.exists() else 0
+        after_en = sum(1 for _ in open(out_en, encoding="utf-8")) if out_en.exists() else 0
+        total_new += (after_np - before_np) + (after_en - before_en)
+
+    print(f"\nAll files done. {total_new} new pairs generated total.")
+    if args.split:
+        build_dataset(out_np, out_en)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Number of chunk files to process (for testing)")
-    args = parser.parse_args()
-    main(limit=args.limit)
+    main()
