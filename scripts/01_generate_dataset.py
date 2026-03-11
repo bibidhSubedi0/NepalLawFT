@@ -11,6 +11,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def log(msg, flush=True):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=flush)
+
 # --- Paths ---
 OUTPUT_DIR = Path("data/processed")
 SPLITS_DIR = Path("data/splits")
@@ -72,7 +77,7 @@ def load_keys():
         i += 1
     if not keys:
         raise ValueError("No GROQ_API_KEY1, GROQ_API_KEY2, ... found in .env")
-    print(f"Loaded {len(keys)} API key(s) — effective rate limit: {REQUESTS_PER_MIN * len(keys)} req/min")
+    log(f"[INIT] Loaded {len(keys)} API key(s) — effective rate limit: {REQUESTS_PER_MIN * len(keys)} req/min")
     return keys
 
 
@@ -101,23 +106,21 @@ class KeyRotator:
                 self._idx += 1
                 return key, self.clients[key]
             wait = min(self.cooldown[k] for k in self.keys) - time.time()
-            print(f"\n  [WAIT] All {len(self.keys)} keys rate-limited. "
-                  f"Resuming in {wait:.1f}s...", flush=True)
+            log(f"[WAIT] All {len(self.keys)} keys rate-limited. Resuming in {wait:.1f}s...")
             time.sleep(max(wait, 1))
 
     def mark_rate_limited(self, key, retry_after=60):
         self.cooldown[key] = time.time() + retry_after
         n_avail = len(self._available())
-        print(f"\n  [LIMIT] Key ...{key[-6:]} cooling down {retry_after}s. "
-              f"{n_avail}/{len(self.keys)} keys still available.", flush=True)
+        log(f"[LIMIT] Key ...{key[-6:]} cooling down {retry_after}s. {n_avail}/{len(self.keys)} keys available.")
 
     def mark_error(self, key, cooldown_secs=30):
         self.cooldown[key] = time.time() + cooldown_secs
-        print(f"\n  [ERROR] Key ...{key[-6:]} cooling down {cooldown_secs}s.", flush=True)
+        log(f"[ERROR] Key ...{key[-6:]} cooling down {cooldown_secs}s.")
 
     def disable(self, key):
         self.cooldown[key] = float("inf")
-        print(f"\n  [DISABLED] Key ...{key[-6:]} permanently disabled.", flush=True)
+        log(f"[DISABLED] Key ...{key[-6:]} permanently disabled.")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +208,8 @@ def ask_groq(rotator, chunk, language):
             return None  # bad JSON shape — skip this chunk
 
         except json.JSONDecodeError:
-            return None  # model returned non-JSON — skip this chunk
+            log(f"[SKIP] Key ...{key[-6:]}: model returned non-JSON, skipping chunk")
+            return None
 
         except Exception as e:
             err = str(e).lower()
@@ -223,7 +227,7 @@ def ask_groq(rotator, chunk, language):
                 # loop — try next key
 
             else:
-                print(f"\n  [WARN] Key ...{key[-6:]}: {e}")
+                log(f"[WARN] Key ...{key[-6:]}: {e}")
                 rotator.mark_error(key, cooldown_secs=30)
                 # loop — try next key
 
@@ -300,7 +304,7 @@ def run_generation(rotator, chunks, out_np, out_en, limit):
 
     already_done = len(seen_np) + len(seen_en)
     if already_done:
-        print(f"Resuming — {len(seen_np)} Nepali + {len(seen_en)} English pairs already done")
+        log(f"[RESUME] {len(seen_np)} Nepali + {len(seen_en)} English pairs already done")
 
     delay     = 60.0 / REQUESTS_PER_MIN / len(rotator.keys)
     total_np  = len(seen_np)
@@ -313,7 +317,7 @@ def run_generation(rotator, chunks, out_np, out_en, limit):
     try:
         for chunk_data in tqdm(chunks, desc="Chunks"):
             if limit and new_total >= limit:
-                print(f"\nReached limit of {limit} new samples.")
+                log(f"[DONE] Reached limit of {limit} new samples.")
                 break
 
             if not is_valid_chunk(chunk_data):
@@ -330,6 +334,7 @@ def run_generation(rotator, chunks, out_np, out_en, limit):
             key  = source + result["question"]
             seen = seen_np if language == "np" else seen_en
             if key in seen:
+                log(f"[SKIP] Duplicate question, skipping")
                 continue
 
             row = format_for_finetuning(result["question"], result["answer"], source)
@@ -344,18 +349,19 @@ def run_generation(rotator, chunks, out_np, out_en, limit):
                 total_en += 1
 
             new_total += 1
+            log(f"[OK] ({language.upper()}) Q: {result['question'][:80]}")
             time.sleep(delay)
 
             if new_total % SAVE_EVERY == 0:
                 f_np.flush()
                 f_en.flush()
-                print(f"\n  {total_np} Nepali + {total_en} English pairs so far...")
+                log(f"[PROGRESS] {total_np} Nepali + {total_en} English pairs so far...")
 
     finally:
         f_np.close()
         f_en.close()
 
-    print(f"\nDone — {total_np} Nepali, {total_en} English pairs")
+    log(f"[DONE] {total_np} Nepali + {total_en} English pairs written")
 
 
 # ---------------------------------------------------------------------------
