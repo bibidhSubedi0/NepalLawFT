@@ -1,4 +1,3 @@
-```markdown
 # NepalLawFT
 
 QLoRA fine-tune of Llama-3.2-3B-Instruct on a domain-specific Nepali legal Q&A dataset. The model is trained to answer questions about Nepal's laws, constitution, and governance documents in both Nepali and English, with source citations.
@@ -40,25 +39,9 @@ Domain-specific Nepali legal Q&A pairs sourced from Nepal's constitution, acts, 
 | Validation | ~400 |
 | Test | ~430 |
 
-## Structure
-
-```
-├── notebooks/
-│   ├── 00_data_split.ipynb       # Train/val/test split
-│   ├── 01_finetune.ipynb         # QLoRA fine-tuning
-│   └── 02_eval.ipynb             # Evaluation pipeline
-├── scripts/
-│   ├── 01_generate_dataset.py    # Dataset generation
-│   └── chunk_audit.py            # Chunk quality audit
-├── space/
-│   ├── app.py                    # Gradio demo
-│   └── requirements.txt
-└── results/                      # Eval outputs and summary
-```
 
 ## Links
 
 - Adapter: [Bibidh/civicLens-llama3.2-3b-nepali-legal](https://huggingface.co/Bibidh/civicLens-llama3.2-3b-nepali-legal)
 - Merged model: [Bibidh/civicLens-llama3.2-3b-nepali-legal-merged](https://huggingface.co/Bibidh/civicLens-llama3.2-3b-nepali-legal-merged)
 - Demo: [Bibidh/NepalLawFT-Demo](https://huggingface.co/spaces/Bibidh/NepalLawFT-Demo)
-```
