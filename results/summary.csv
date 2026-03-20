@@ -1,0 +1,5 @@
+Metric,Base,Fine-tuned,Delta (%)
+ROUGE-L,0.1975,0.2913,+47.5%
+BLEU (char bigram),0.3827,0.4798,+25.4%
+Semantic Similarity,0.5400000214576721,0.6822999715805054,+26.4%
+LLM Judge (1-5),1.72,2.6,+51.2%
